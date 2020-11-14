@@ -1,4 +1,4 @@
-# Metalp-SAS
+# Implementazione e modelli predittivi di efficientamento per macchine aziendali 4.0
 Tesi Metalp SAS Emanuele Carnati
 
 Abstract

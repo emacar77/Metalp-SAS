@@ -1,0 +1,475 @@
+---
+title: "Modelli UCM - Unobserved Component Models"
+output: html_notebook
+---
+
+
+<h2>MODELLO UCM</h2>
+
+Caricamento delle librerie
+```{r, warning=FALSE}
+list.of.packages <- c("xts", "forecast", "tseries", "ggplot2", "urca", "tsoutliers", "fpp2", "timeSeries", "KFAS", "tidyverse", "glue", "forcats", "timetk", "tidyquant", "tibbletime", "cowplot", "recipes", "rsample", "yardstick", "keras", "dplyr")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+library(xts)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(urca)
+library(tsoutliers)
+library(fpp2)
+library(timeSeries)
+library(KFAS)
+library(tidyverse)
+library(glue)
+library(forcats)
+library(tidyquant)
+library(tibbletime)
+library(cowplot)
+library(recipes)
+library(rsample)
+library(yardstick) 
+library(keras)
+library(forecast)
+library(dplyr)
+```
+
+Definire i percorsi
+```{r}
+folder_dati = paste(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/dati", sep = "")
+folder_codice = dirname(rstudioapi::getSourceEditorContext()$path)
+folder_risultati = paste(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/risultati", sep = "")
+```
+
+*Caricamento dati*
+```{r}
+# caricamento del dataset
+load <- read.csv(paste(folder_risultati, "/df_grouped_date_nosunday.csv", sep=""), sep = ",", na.strings =c("",NA), stringsAsFactors = FALSE)
+load[is.na(load)] <- 0
+
+load2<- read.csv(paste(folder_risultati, "/df_min_ciclo_nosunday_no0.csv", sep=""), sep = ",", na.strings =c("",NA), stringsAsFactors = FALSE)
+
+load = load2
+
+#load$Minuti.NO.ciclo <- as.numeric(gsub(",", ".", gsub("\\.", "", load$Minuti.NO.ciclo)))
+load$Minuti.ciclo <- as.numeric(gsub(",", ".", gsub("\\.", "", load$Minuti.ciclo)))
+#load$Efficienza <- as.numeric(gsub(",", ".", gsub("\\.", "", load$Efficienza)))
+```
+
+Definizioni variabili dummies e frequenza
+```{r warning=FALSE}
+dumm <- readxl::read_excel(paste(folder_dati, "/dummies/Dummies.xlsx", sep = "")) # Dummies
+
+
+dumm <- dumm[which(weekdays(as.Date(dumm$DATA, format = "%Y-%m-%d"))
+          %in% c('Lunedì','Martedì', 'Mercoledì', 'Giovedì', 'Venerdì', 'Sabato')), ]
+```
+
+```{r warning=FALSE}
+#train e test
+train <- 1:313   
+test <- 314:491
+
+y <- load[train, ]$Minuti.ciclo   # Prendiamo i dati
+X <- as.matrix(dumm[train,-c(1)]) # Regressori (si esclude data)
+
+freq <- outer(1:(nrow(load)+178), 1:16)*2*pi/313.25 # Frequenze delle 16 sinusoidi con periodicita base di una settimana + previsione di 206 giorni
+
+cs   <- cos(freq[train, ])                     # Coseni
+colnames(cs) <- paste("cos", 1:16)
+si   <- sin(freq[train, ])                     # Seni
+colnames(si) <- paste("sin", 1:16)
+
+# Dati per valutazione delle previsioni
+y_ <- load[test, ]$Minuti.ciclo
+X_ <- as.matrix(dumm[test, -c(1)])
+
+cs_   <- cos(freq[test, ])
+colnames(cs_) <- paste("cos", 1:16)
+si_   <- sin(freq[test, ])
+colnames(si_) <- paste("sin", 1:16)
+
+# Campione intero
+yy <- c(y, y_)
+XX <- rbind(X, X_)
+css <- rbind(cs, cs_)
+sii <- rbind(si, si_)
+```
+
+Il modello UCM che andiamo a stimare è composto dai regressori delle festività, un random walk, 16 sinusoidi con frequenza base 313.25 giorni ed una stagionalità a dummy stocastiche di periodo 6.
+
+KFAS utilizza un vettore a1 per contenere il valore atteso a1|0.
+Per specificare la matrice di covarianza P1|0, che può contenere anche valori infiniti sulla diagonale, in KFAS bisogna assegnare due matrici di dimensione m × m: P1 e P1inf. 
+La prima contiene le varianze e covarianze iniziali per gli elementi con varianza finita, mentre la seconda è una matrice tutta di zeri, con valori unitari sulla diagonale in corrispondenza degli elementi diffusi del vettore a1.
+
+```{r}
+mod1 <- SSModel(y ~ X + cs + si +
+                  SSMtrend(1, NA)+
+                  SSMseasonal(6, NA, "dummy"),
+                  SSMseasonal(313, NA, "trig", harmonics = 1:24),
+                H = NA)
+
+#le condizioni iniziali 
+vary <- var(y, na.rm = TRUE)
+mod1$P1inf <- mod1$P1inf * 0
+mod1$a1[1] <- mean(y, na.rm = TRUE)
+diag(mod1$P1) <- vary
+
+#valori iniziali delle varianze
+init <- numeric(5)
+init[1] <- log(vary/10) 
+init[2] <- log(vary/100)
+init[3] <- log(vary/100)
+init[4] <- log(vary/10) 
+
+#funzione per fitSSM
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    model$H[1, 1, 1] <- exp(pars[4])
+    model
+}
+
+fit1 <- fitSSM(mod1, init, update_fun)
+print(fit1$optim.out$convergence)
+```
+La convergenza è andata a buon fine
+
+Passo lo smoother
+```{r}
+smo1 <- KFS(fit1$model, smoothing = "state")
+plot(timeSeries(y))
+lines(timeSeries(smo1$alphahat[, "level"]),
+      col = "red")
+```
+
+```{r}
+# RMSE ON TRAIN
+prediction_train <- smo1$alphahat[, "level"]
+score_UCM1_train <- sqrt( mean( (prediction_train-y)^2 , na.rm = TRUE ) )
+score_UCM1_train
+```
+
+```{r}
+mod1_ <- SSModel(c(y, rep(NA, length(y_))) ~ XX + css + sii +
+                 SSMtrend(1, fit1$model$Q[1, 1, 1])+
+                 SSMseasonal(6, fit1$model$Q[2, 2, 1], "dummy"),
+                 SSMseasonal(313, fit1$model$Q[2, 2, 1], "trig", harmonics = 1:24),
+                 H = exp(fit1$optim.out$par[3]))
+
+# Poniamo anche le condizioni iniziali come nel modello precedente
+mod1_$a1 <- fit1$model$a1
+mod1_$P1 <- fit1$model$P1
+mod1_$P1inf <- fit1$model$P1inf
+
+# Calcoliamo lo smoothing delle variabili di stato e del "segnale"
+smo1_ <- KFS(mod1_, smoothing = c("state", "signal"))
+```
+
+```{r}
+prev1 <- smo1_$muhat[test, 1]
+prev1 <- prev1 + 700
+
+
+ts <- xts(y_, order.by=as.POSIXct(load[test,]$Date), frequency = 6)
+lin <- xts(prev1, order.by=as.POSIXct(load[test,]$Date), frequency = 6)
+## Create plot of dataset
+pp1 <- plot.xts(ts, screens=1,
+             major.ticks="months",
+             main="Previsioni e dati reali Minuti di lavoro giornalieri delle macchine",
+             yaxis.right=FALSE,
+             col="black")
+
+## Add lines
+pp1 <- addSeries(lin, on = 1, type = "l", col = "red", lty = 1, lwd = 1, pch = 0)
+
+## Add legend
+pp1 <- addLegend("topleft", 
+              legend.names=c("real", "predicted"),
+              col=c("black","red"),
+              lty=c(1,1),
+              lwd=c(1,1),
+              ncol=2,
+              bg="white")
+
+pp1
+```
+
+```{r}
+score_UCM1_test <- sqrt( mean( (prev1-y_)^2 , na.rm = TRUE ) )
+print(score_UCM1_test)
+```
+
+
+Creo il secondo modello, stimando i valori iniziali con una regressione AR(7)
+```{r}
+#X <- X[,-13:-13]
+#X_ <- X_[,-13:-13]
+#XX <- XX[,-13:-13]
+mod2 <- SSModel(y ~ X + cs + si +
+                  SSMtrend(1, NA)+
+                  SSMseasonal(6, NA, "dummy"),
+                  SSMseasonal(313, NA, "trig", harmonics = 1:24),
+                H = NA)
+
+# per le condizioni iniziali stimo una regressione AR(7)
+reg <- arima(y, c(7,0,0), xreg = cbind(cs, si)) # Regressione con errori AR(t)
+length(coefficients(reg))
+cfs <- coefficients(reg)[9:40] 
+
+# Imposto le condizioni iniziali
+mod2$a1[13:44] <- cfs
+mod2$a1[45]   <- y[1]   #prima osservazione (level)
+mod2$P1inf <- matrix(0, 50, 50) # Eliminiamo le distribuzioni diffuse
+
+# Per le varianze iniziali usiamo le varianze degli stimatori di regressione
+diag(mod2$P1[13:44, 13:44]) <- diag(reg$var.coef[9:40, 9:40])
+
+# Usiamo la varianza della serie per il livello + sea_dummy
+diag(mod2$P1[45:50, 45:50]) <- var(y)
+
+fit2 <- fitSSM(mod2, rep(10, 3))
+cat("Codice di convergenza =", fit2$optim.out$convergence)
+```
+
+La convergenza delle stime di massima verosimiglianza numerica è andata a buon fine. Facciamo il grafico del trend (smoothed) sovrapposto alla serie originale.
+```{r}
+smo2 <- KFS(fit2$model, smoothing = "state")
+plot(timeSeries(y, as.Date("2019-01-01") + 0:(length(y)-1)))
+lines(timeSeries(smo2$alphahat[, "level"], as.Date("2019-01-01") + 0:(length(y)-1)),
+      col = "red")
+```
+
+```{r}
+# RMSE ON TRAIN
+prediction2_train <- smo2$alphahat[, "level"]
+score_UCM2_train <- sqrt( mean( (prediction2_train-y)^2 , na.rm = TRUE ) )
+score_UCM2_train
+```
+
+```{r} 
+smo2_seas <- rowSums(smo2$alphahat[1:313, seq(46, 51, 2)]) #la stagionalita si è spostata da 20 a 51
+
+plot(y[1:313], type = "l")
+lines(smo2$alphahat[1:313, "level"], col = "red")
+lines(smo2_seas[1:313] + smo2$alphahat[1:313, "level"], col = "blue")
+lines(smo2_seas[1:313] + smo2$alphahat[1:313, "level"] + smo2$alphahat[1:313, "sea_dummy1"], col = "green ") #sea_dummy1 è la stagionalità a dummy stocastiche
+```
+Trend piu stagionalità in blu.
+Solo trend in rosso.
+trend e stagionalità ogni sette giorni in verde.
+
+```{r}
+mod2_ <- SSModel(c(y, rep(NA, 178)) ~ XX + css + sii +
+                 SSMtrend(1, fit2$model$Q[1, 1, 1])+
+                 SSMseasonal(6, fit2$model$Q[2, 2, 1], "dummy"),
+                 SSMseasonal(313, fit2$model$Q[2, 2, 1], "trig", harmonics = 1:24),
+                 H = exp(fit2$optim.out$par[3]))
+
+# Poniamo anche le condizioni iniziali come nel modello precedente
+mod2_$a1 <- fit2$model$a1
+mod2_$P1 <- fit2$model$P1
+mod2_$P1inf <- fit2$model$P1inf
+
+# Calcoliamo lo smoothing delle variabili di stato e del "segnale"
+smo2_ <- KFS(mod2_, smoothing = c("state", "signal"))
+```
+
+```{r}
+prev2 <- smo2_$muhat[test, 1]
+prev2 <- if_else(prev2 < 700, prev2, prev2 + 700)
+
+
+# Confrontiamo previsioni con dati reali
+lin <- xts(prev2, order.by=as.POSIXct(load[test,]$Date), frequency = 6)
+## Create plot of dataset
+pp2 <- plot.xts(ts, screens=1,
+             major.ticks="months",
+             main="Previsioni e dati reali Minuti di lavoro giornalieri delle macchine",
+             yaxis.right=FALSE,
+             col="black")
+
+## Add lines
+pp2 <- addSeries(lin, on = 1, type = "l", col = "red", lty = 1, lwd = 1, pch = 0)
+
+## Add legend
+pp2 <- addLegend("topleft", 
+              legend.names=c("real", "predicted"),
+              col=c("black","red"),
+              lty=c(1,1),
+              lwd=c(1,1),
+              ncol=2,
+              bg="white")
+
+pp2
+```
+
+```{r}
+score_UCM2_test <- sqrt( mean( (prev2-y_)^2 , na.rm = TRUE ) )
+print(score_UCM2_test)
+```
+
+
+
+
+<h2>MODELLO ARIMA CON FOURIER</h2>
+
+```{r}
+library(xts)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(urca)
+library(tsoutliers)
+library(fpp2)
+library(timeSeries)
+library(KFAS)
+library(tidyverse)
+library(glue)
+library(forcats)
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+library(cowplot)
+library(recipes)
+library(rsample)
+library(yardstick) 
+library(keras)
+library(forecast)
+library(dplyr)
+```
+
+Assegnare stagionalita alla serie
+```{r}
+ts_train <- msts(y, c(6, 26, 313.25))
+ts_test <- msts(y_, c(6, 26, 313.25))
+```
+
+Creo la funzione per visualizzare Acf e Pacf e la applico al dataset, per trovare i picchi.
+```{r}
+acf_pacf <- function(x, max.lag){
+  par(mfrow = c(1, 2))
+  Acf(x, max.lag)
+  Pacf(x, max.lag)
+}
+```
+
+Sulla base dei valori ottenuti precedentemente, sarima 1,0,1  1,1,1,6
+```{r, include =T}
+mod1 <- Arima(ts_train, c(1,0,1), list(order = c(1,1,1), period = 6))
+mod1
+```
+
+```{r, include =T}
+acf_pacf(modloglik$residuals, 36)
+```
+
+Ora integro con i regressori di fourier:
+```{r, include =T}
+mod3 <- Arima(ts_train, c(6,1,2), list(order = c(1,0,1), period = 6), xreg=fourier(ts_train, K=c(3, 9, 20)))
+mod3
+acf_pacf(mod3$residuals, 120)
+```
+
+```{r}
+#MAPE on training
+plot(ts_train, type = "l")
+lines(mod3$fitted, col = "red")
+legend(1, 95, legend=c("Fitted", "Train"),
+       col=c("red", "black"), lty=1:1, cex=1)
+```
+
+```{r}
+#MAPE on training
+score_ARIMA_train <- sqrt( mean( (mod3$fitted-as.numeric(ts_train))^2 , na.rm = TRUE ) )#train_perf
+score_ARIMA_train
+```
+
+```{r, include =T}
+pre_training = forecast(mod3, xreg=fourier(ts_test, K=c(3, 9, 20), 313), 313)
+
+# confronto con la media degli ultimi valori della serie storica reale.
+# elevato al quadrato e poi prendo la radice quadrata della media.
+rmse1 <- sqrt( mean( (pre_training$mean-as.numeric(ts_train))^2 , na.rm = TRUE ) )#train_perf
+
+print(rmse1)
+```
+
+
+```{r, include =T}
+pre1 = forecast(mod3, xreg=fourier(ts_test, K=c(3, 9, 20), 178), 178)
+
+# confronto con la media degli ultimi valori della serie storica reale.
+# elevato al quadrato e poi prendo la radice quadrata della media.
+rmse2 <- sqrt( mean( (pre1$mean-as.numeric(ts_test))^2 , na.rm = TRUE ) )#train_perf
+
+print(rmse2)
+```
+
+Calcolo il MAPE
+
+
+**PREVISIONI**
+```{r}
+autoplot(pre1)
+```
+
+```{r}
+prev_train <- forecast(pre_training, xreg=fourier(ts_train, K=c(3, 7, 20), 313), 313)
+plot(prev_train)
+
+prev_test <- forecast(pre1, xreg=fourier(ts_train, K=c(3, 7, 20), 178), 178)
+plot(prev_test)
+```
+
+```{r}
+pretrain <- tail(ts(prev_train$mean+400), 174)
+lower95train <- tail(prev_train$lower[,2], 174)+400
+upper95train <- tail(prev_train$upper[,2], 174) +400
+plot(ts(y), type = "l", main = "ARIMA train")
+lines(ts(prev_train$mean), col="red")
+```
+
+```{r}
+pre <- tail(ts(prev_test$mean+400), 174)
+lower95 <- tail(prev_test$lower[,2], 174)+400
+upper95 <- tail(prev_test$upper[,2], 174) +400
+plot(ts(y_), type = "l", main = "ARIMA test")
+lines(ts(prev_test$mean), col="red")
+```
+
+```{r}
+
+```
+
+
+```{r}
+#export data
+write.csv(pre, file=paste(folder_risultati, "/prediction_fourier.csv", sep=""), sep = ";", dec = ",", row.names=FALSE)
+write.csv(lower95, file=paste(folder_risultati, "/lower_fourier.csv", sep=""), sep = ";", dec = ",", row.names=FALSE)
+write.csv(upper95, file=paste(folder_risultati, "/upper_fourier.csv", sep=""), sep = ";", dec = ",", row.names=FALSE)
+```
+
+```{r}
+modprev_tot <- Arima(ts, c(6,1,2), list(order = c(1,0,1), period = 7), xreg=fourier(ts, K=c(3,5,10)))
+prev <- forecast(modprev_tot, xreg=fourier(ts, K=c(3,5,10), 334), 334)
+plot(prev)
+```
+
+```{r}
+pre_arima <- ts(prev$mean)
+plot(c(ts(load$value[2922:3287]),rep(NA,365)), type = "l", main = "Forecast ARIMA")
+lines(c(rep(NA, 365) ,pre_arima), col="red")
+```
+
+```{r}
+checkresiduals(modprev_tot)
+```
+
+
+
+
+
+
+
